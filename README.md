@@ -33,7 +33,7 @@ The daemon reads your exact reset time from Anthropic's OAuth usage API (the sam
 **Requirements:** Node.js 16+, Claude Code CLI installed and logged in.
 
 ```bash
-git clone https://github.com/your-username/claude-reset.git
+git clone https://github.com/baraakh30/claude-reset.git
 cd claude-reset
 npm install
 npm link
