@@ -3,6 +3,7 @@
 const { program } = require('commander');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 const { spawnSync, spawn } = require('child_process');
 const chalk = require('chalk');
 
@@ -239,12 +240,139 @@ program.command('reset-time')
     }
   });
 
-// config set / show
+// ─── Interactive config helper ────────────────────────────────────────────────
+
+function rl() {
+  return readline.createInterface({ input: process.stdin, output: process.stdout });
+}
+
+function ask(iface, question) {
+  return new Promise(resolve => iface.question(question, resolve));
+}
+
+function parseDays(input) {
+  if (!input) return null;
+  const s = input.trim().toLowerCase();
+  if (s === 'all') return ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+  if (s === 'mon-fri' || s === 'weekdays') return ['mon', 'tue', 'wed', 'thu', 'fri'];
+  return s.split(/[,\s]+/).map(d => d.slice(0, 3)).filter(Boolean);
+}
+
+async function interactiveConfigSet() {
+  const cfg = configLib.read();
+  const iface = rl();
+  const sep = chalk.dim('─'.repeat(48));
+
+  console.log();
+  console.log(chalk.bold('Claude Session Keeper — Configure'));
+  console.log(sep);
+  console.log(chalk.dim('Current values shown in [brackets]. Press Enter to keep.'));
+  console.log();
+
+  const fields = [
+    {
+      label: 'Target time  (when you plan to start working, 24h HH:MM)',
+      key: 'target_times',
+      display: cfg => (cfg.target_times || ['17:00']).join(', '),
+      parse: v => {
+        if (!v) return null;
+        const times = v.split(/[,\s]+/).map(t => t.trim()).filter(Boolean);
+        return times.length === 1 ? times : times; // store as array
+      },
+      apply: (cfg, v) => { cfg.target_times = Array.isArray(v) ? v : [v]; delete cfg.target_time; }
+    },
+    {
+      label: 'Active days  (comma-separated, "all", or "mon-fri")',
+      key: 'days',
+      display: cfg => (cfg.days || []).join(', '),
+      parse: v => v ? parseDays(v) : null,
+      apply: (cfg, v) => { cfg.days = v; }
+    },
+    {
+      label: 'Ping 1 lead  (minutes before target — fires first)',
+      key: 'pings[0].lead_minutes',
+      display: cfg => String((cfg.pings || [])[0]?.lead_minutes ?? 300),
+      parse: v => v ? parseInt(v) : null,
+      apply: (cfg, v) => { cfg.pings = cfg.pings || []; cfg.pings[0] = { ...cfg.pings[0], lead_minutes: v }; }
+    },
+    {
+      label: 'Ping 2 lead  (minutes before target — fires second)',
+      key: 'pings[1].lead_minutes',
+      display: cfg => String((cfg.pings || [])[1]?.lead_minutes ?? 270),
+      parse: v => v ? parseInt(v) : null,
+      apply: (cfg, v) => { cfg.pings = cfg.pings || []; cfg.pings[1] = { ...cfg.pings[1], lead_minutes: v }; }
+    },
+    {
+      label: 'Log level    (silent / info / verbose)',
+      key: 'log_level',
+      display: cfg => cfg.log_level || 'info',
+      parse: v => v || null,
+      apply: (cfg, v) => { cfg.log_level = v; }
+    },
+    {
+      label: 'Claude path  ("auto" = resolve via `which claude`)',
+      key: 'claude_path',
+      display: cfg => cfg.claude_path || 'auto',
+      parse: v => v || null,
+      apply: (cfg, v) => { cfg.claude_path = v; }
+    }
+  ];
+
+  const changes = [];
+
+  for (const field of fields) {
+    const current = field.display(cfg);
+    const raw = await ask(iface, `  ${field.label}\n  ${chalk.dim('['+ current +']')} › `);
+    const parsed = field.parse(raw.trim());
+    if (parsed !== null && String(parsed) !== current) {
+      field.apply(cfg, parsed);
+      changes.push({ key: field.key, value: parsed });
+    }
+    console.log();
+  }
+
+  iface.close();
+
+  if (changes.length === 0) {
+    console.log(chalk.dim('No changes made.'));
+    return;
+  }
+
+  configLib.write(cfg);
+  console.log(sep);
+  console.log(chalk.green('✓ Config saved') + chalk.dim(`  → ${CONFIG_FILE}`));
+  for (const { key, value } of changes) {
+    console.log(chalk.dim(`  ${key} = ${JSON.stringify(value)}`));
+  }
+  if (isDaemonRunning()) {
+    console.log(chalk.dim('\nDaemon will pick up changes within 5 minutes.'));
+  }
+  console.log();
+}
+
+// ─── config commands ──────────────────────────────────────────────────────────
+
 const configCmd = program.command('config');
 
-configCmd.command('set <key> <value>')
-  .description('Set a config value (e.g. csk config set target_time 18:00)')
-  .action((key, value) => {
+configCmd.command('set [key] [value]')
+  .description('Set a config value — interactive when called with no arguments')
+  .action(async (key, value) => {
+    // No args → full interactive wizard
+    if (!key) {
+      await interactiveConfigSet();
+      return;
+    }
+    // key only → prompt for value
+    if (!value) {
+      const cfg = configLib.read();
+      const current = cfg[key] !== undefined ? JSON.stringify(cfg[key]) : 'unset';
+      const iface = rl();
+      value = await ask(iface, `  ${key} ${chalk.dim('[' + current + ']')} › `);
+      iface.close();
+      value = value.trim();
+      if (!value) { console.log(chalk.dim('No change.')); return; }
+    }
+    // key + value → direct set (scriptable)
     const updated = configLib.set(key, value);
     console.log(chalk.green(`✓ ${key} = ${JSON.stringify(updated[key] !== undefined ? updated[key] : value)}`));
     console.log(chalk.dim(`Saved to ${CONFIG_FILE}`));
