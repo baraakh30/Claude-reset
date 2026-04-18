@@ -145,8 +145,10 @@ Warnings appear after every `csk config set` and in `csk status`.
 ### macOS (launchd)
 `csk start` installs a launchd agent at `~/Library/LaunchAgents/com.csk.daemon.plist` with `KeepAlive: true` — it auto-restarts if it crashes and survives reboots.
 
-### Linux (manual / systemd coming)
-Falls back to a detached background process. Pull requests for systemd support welcome.
+### Linux — systemd ⚠️ experimental
+`csk start` writes a systemd user service to `~/.config/systemd/user/csk.service`, enables lingering so it survives logout, and starts it with `systemctl --user enable --now csk`. Falls back to a detached process if systemd is unavailable.
+
+> Linux support is experimental. If you run into issues please open a GitHub issue.
 
 ---
 
