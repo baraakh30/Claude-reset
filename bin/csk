@@ -1,0 +1,292 @@
+#!/usr/bin/env node
+
+const { program } = require('commander');
+const fs = require('fs');
+const path = require('path');
+const { spawnSync, spawn } = require('child_process');
+const chalk = require('chalk');
+
+const { PID_FILE, LOG_FILE, LOG_DIR, CONFIG_FILE, CSK_DIR, PLIST_FILE } = require('../lib/paths');
+const configLib = require('../lib/config');
+const stateLib = require('../lib/state');
+const { printStatus, printInfo, formatTime, formatRelative } = require('../lib/display');
+const { computePingSchedule } = require('../lib/schedule');
+
+function isDaemonRunning() {
+  if (!fs.existsSync(PID_FILE)) return false;
+  const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim());
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
+
+function initDirs() {
+  fs.mkdirSync(CSK_DIR, { recursive: true });
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+}
+
+function writePlist(scriptPath) {
+  const plistDir = path.dirname(PLIST_FILE);
+  fs.mkdirSync(plistDir, { recursive: true });
+
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.csk.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${process.execPath}</string>
+    <string>${scriptPath}</string>
+    <string>_daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/daemon.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/daemon.stderr.log</string>
+</dict>
+</plist>`;
+
+  fs.writeFileSync(PLIST_FILE, plist);
+}
+
+function startDirectly() {
+  initDirs();
+  const scriptPath = path.resolve(__filename);
+  const out = fs.openSync(path.join(LOG_DIR, 'daemon.stdout.log'), 'a');
+  const err = fs.openSync(path.join(LOG_DIR, 'daemon.stderr.log'), 'a');
+  const child = spawn(process.execPath, [scriptPath, '_daemon'], {
+    detached: true,
+    stdio: ['ignore', out, err]
+  });
+  child.unref();
+  console.log(chalk.green(`✓ Daemon started (PID=${child.pid})`));
+  console.log(chalk.dim(`  Logs: ${LOG_FILE}`));
+}
+
+// ─── Commands ────────────────────────────────────────────────────────────────
+
+program.name('csk').description('Claude Code Session Keeper').version('1.0.0');
+
+// start
+program.command('start')
+  .description('Start the CSK daemon')
+  .action(() => {
+    if (isDaemonRunning()) {
+      console.log(chalk.yellow('Daemon is already running. Use `csk status` to check.'));
+      return;
+    }
+
+    initDirs();
+
+    if (!fs.existsSync(CONFIG_FILE)) {
+      configLib.write(configLib.DEFAULTS);
+      console.log(chalk.dim(`Config created at ${CONFIG_FILE}`));
+    }
+
+    if (process.platform === 'darwin') {
+      const scriptPath = path.resolve(__filename);
+      writePlist(scriptPath);
+      try {
+        spawnSync('launchctl', ['unload', PLIST_FILE], { stdio: 'pipe' });
+        const r = spawnSync('launchctl', ['load', PLIST_FILE], { stdio: 'pipe', encoding: 'utf8' });
+        if (r.status !== 0) throw new Error(r.stderr || 'launchctl load failed');
+        console.log(chalk.green('✓ Daemon started via launchd'));
+        console.log(chalk.dim(`  Plist: ${PLIST_FILE}`));
+        console.log(chalk.dim(`  Logs:  ${LOG_FILE}`));
+        return;
+      } catch (e) {
+        console.log(chalk.yellow(`launchd failed (${e.message}), falling back to direct launch`));
+      }
+    }
+
+    startDirectly();
+  });
+
+// stop
+program.command('stop')
+  .description('Stop the CSK daemon')
+  .action(() => {
+    let stopped = false;
+
+    if (process.platform === 'darwin' && fs.existsSync(PLIST_FILE)) {
+      const r = spawnSync('launchctl', ['unload', PLIST_FILE], { stdio: 'pipe', encoding: 'utf8' });
+      if (r.status === 0) {
+        console.log(chalk.green('✓ Daemon stopped (launchd)'));
+        stopped = true;
+      }
+    }
+
+    if (!stopped) {
+      if (!fs.existsSync(PID_FILE)) {
+        console.log(chalk.yellow('Daemon is not running.'));
+        return;
+      }
+      const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim());
+      try {
+        process.kill(pid, 'SIGTERM');
+        console.log(chalk.green(`✓ Daemon stopped (PID=${pid})`));
+      } catch (e) {
+        console.error(chalk.red('Failed to stop daemon:'), e.message);
+      }
+    }
+
+    try { fs.unlinkSync(PID_FILE); } catch {}
+  });
+
+// status
+program.command('status')
+  .description('Show daemon status and next scheduled ping')
+  .action(() => {
+    const config = configLib.read();
+    const state = stateLib.read();
+    printStatus(state, config, isDaemonRunning());
+  });
+
+// info
+program.command('info')
+  .description('Show full config and session limit info')
+  .action(() => {
+    const config = configLib.read();
+    const state = stateLib.read();
+    printInfo(state, config);
+  });
+
+// logs
+program.command('logs')
+  .description('Tail the daemon log file')
+  .option('-n, --lines <n>', 'Lines to show initially', '50')
+  .action((opts) => {
+    if (!fs.existsSync(LOG_FILE)) {
+      console.log(chalk.gray('No log file yet. Start the daemon first.'));
+      return;
+    }
+    spawnSync('tail', ['-f', '-n', opts.lines, LOG_FILE], { stdio: 'inherit' });
+  });
+
+// ping now
+const pingCmd = program.command('ping');
+pingCmd.command('now')
+  .description('Fire a ping immediately (for testing)')
+  .action(() => {
+    const config = configLib.read();
+    const { runPing } = require('../lib/ping');
+    console.log(chalk.dim('Pinging claude -p "hi"...'));
+    const result = runPing(config.claude_path);
+
+    if (result.result === 'success') {
+      console.log(chalk.green('✓ Ping successful'));
+      console.log(chalk.dim('  ' + result.response_snippet.split('\n')[0].slice(0, 120)));
+    } else if (result.result === 'limit_hit') {
+      console.log(chalk.yellow('⚠ Usage limit hit'));
+      if (result.reset_at) {
+        console.log(`  Resets: ${formatTime(result.reset_at)}  ${chalk.dim(formatRelative(result.reset_at))}`);
+      }
+      console.log(chalk.dim('  ' + result.response_snippet.split('\n')[0].slice(0, 120)));
+    } else {
+      console.log(chalk.red('✗ Error (exit=' + result.exit_code + ')'));
+      console.log(chalk.dim('  ' + result.response_snippet.split('\n')[0].slice(0, 120)));
+    }
+
+    stateLib.update({ last_ping: result });
+  });
+
+// reset-time
+program.command('reset-time')
+  .description('Fetch and show exact reset times via OAuth API')
+  .action(async () => {
+    const { fetchUsage } = require('../lib/usage');
+    console.log(chalk.dim('Calling Anthropic OAuth usage API...'));
+
+    try {
+      const usage = await fetchUsage(true);
+      stateLib.update({ usage });
+
+      console.log();
+      console.log(chalk.bold('Session Reset Times') + chalk.dim('  (source: OAuth API — exact)'));
+      console.log(chalk.dim('─'.repeat(50)));
+
+      if (usage.five_hour_resets_at != null) {
+        const rel = formatRelative(usage.five_hour_resets_at);
+        const pct = usage.five_hour_utilization?.toFixed(1) ?? '?';
+        console.log(`  5-hour limit  :  ${formatTime(usage.five_hour_resets_at)}  ${chalk.dim(rel)}`);
+        console.log(`                   ${chalk.dim(pct + '% of limit used')}`);
+      }
+
+      if (usage.seven_day_resets_at != null) {
+        const rel = formatRelative(usage.seven_day_resets_at);
+        const pct = usage.seven_day_utilization?.toFixed(1) ?? '?';
+        console.log(`  7-day limit   :  ${formatTime(usage.seven_day_resets_at)}  ${chalk.dim(rel)}`);
+        console.log(`                   ${chalk.dim(pct + '% of limit used')}`);
+      }
+
+      console.log();
+    } catch (e) {
+      console.error(chalk.red('API call failed:'), e.message);
+
+      const state = stateLib.read();
+      if (state.usage?.five_hour_resets_at) {
+        console.log(chalk.dim(`Cached (${state.usage.source}): 5hr resets ${formatTime(state.usage.five_hour_resets_at)}`));
+      } else if (state.last_ping?.reset_at) {
+        console.log(chalk.yellow(`From last ping error: resets ${formatTime(state.last_ping.reset_at)}`));
+      } else {
+        console.log(chalk.dim('No cached reset time available. Run `csk ping now` to try.'));
+      }
+    }
+  });
+
+// config set / show
+const configCmd = program.command('config');
+
+configCmd.command('set <key> <value>')
+  .description('Set a config value (e.g. csk config set target_time 18:00)')
+  .action((key, value) => {
+    const updated = configLib.set(key, value);
+    console.log(chalk.green(`✓ ${key} = ${JSON.stringify(updated[key] !== undefined ? updated[key] : value)}`));
+    console.log(chalk.dim(`Saved to ${CONFIG_FILE}`));
+    if (isDaemonRunning()) {
+      console.log(chalk.dim('Daemon will pick up the change within 5 minutes.'));
+    }
+  });
+
+configCmd.command('show')
+  .description('Print current config as JSON')
+  .action(() => {
+    console.log(JSON.stringify(configLib.read(), null, 2));
+  });
+
+// init
+program.command('init')
+  .description('Initialize ~/.csk/ with default config')
+  .action(() => {
+    initDirs();
+    if (!fs.existsSync(CONFIG_FILE)) {
+      configLib.write(configLib.DEFAULTS);
+      console.log(chalk.green(`✓ Created ${CONFIG_FILE}`));
+    } else {
+      console.log(chalk.yellow(`Config already exists at ${CONFIG_FILE}`));
+    }
+    console.log(chalk.green('✓ ~/.csk/ ready'));
+    console.log();
+    console.log('Quick start:');
+    console.log(chalk.dim('  csk config set target_time 17:00   # when you plan to work'));
+    console.log(chalk.dim('  csk reset-time                     # verify API access'));
+    console.log(chalk.dim('  csk ping now                       # test a ping'));
+    console.log(chalk.dim('  csk start                          # start the daemon'));
+  });
+
+// _daemon (internal — invoked by launchd or direct spawn)
+program.command('_daemon', { hidden: true })
+  .action(async () => {
+    const { mainLoop } = require('../lib/daemon');
+    await mainLoop();
+  });
+
+program.parseAsync(process.argv).catch(e => {
+  console.error(chalk.red('Error:'), e.message);
+  process.exit(1);
+});
