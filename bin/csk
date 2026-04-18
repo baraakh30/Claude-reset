@@ -289,14 +289,30 @@ async function interactiveConfigSet() {
       apply: (cfg, v) => { cfg.days = v; }
     },
     {
-      label: 'Ping 1 lead  (minutes before target — fires first)',
+      label: (cfg) => {
+        const lead = (cfg.pings || [])[0]?.lead_minutes ?? 300;
+        const [tH, tM] = (cfg.target_times?.[0] || '17:00').split(':').map(Number);
+        const pingMins = tH * 60 + (tM || 0) - lead;
+        const h = Math.floor(((pingMins % 1440) + 1440) % 1440 / 60);
+        const m = ((pingMins % 1440) + 1440) % 1440 % 60;
+        const fire = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+        return `Ping 1 lead  (minutes before target, must be ≥300 for 5hr reset)\n  ${chalk.dim('fires at ' + fire + ' with current target')}`;
+      },
       key: 'pings[0].lead_minutes',
       display: cfg => String((cfg.pings || [])[0]?.lead_minutes ?? 300),
       parse: v => v ? parseInt(v) : null,
       apply: (cfg, v) => { cfg.pings = cfg.pings || []; cfg.pings[0] = { ...cfg.pings[0], lead_minutes: v }; }
     },
     {
-      label: 'Ping 2 lead  (minutes before target — fires second)',
+      label: (cfg) => {
+        const lead = (cfg.pings || [])[1]?.lead_minutes ?? 270;
+        const [tH, tM] = (cfg.target_times?.[0] || '17:00').split(':').map(Number);
+        const pingMins = tH * 60 + (tM || 0) - lead;
+        const h = Math.floor(((pingMins % 1440) + 1440) % 1440 / 60);
+        const m = ((pingMins % 1440) + 1440) % 1440 % 60;
+        const fire = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+        return `Ping 2 lead  (minutes before target, safety net)\n  ${chalk.dim('fires at ' + fire + ' with current target')}`;
+      },
       key: 'pings[1].lead_minutes',
       display: cfg => String((cfg.pings || [])[1]?.lead_minutes ?? 270),
       parse: v => v ? parseInt(v) : null,
@@ -322,7 +338,8 @@ async function interactiveConfigSet() {
 
   for (const field of fields) {
     const current = field.display(cfg);
-    const raw = await ask(iface, `  ${field.label}\n  ${chalk.dim('['+ current +']')} › `);
+    const label = typeof field.label === 'function' ? field.label(cfg) : field.label;
+    const raw = await ask(iface, `  ${label}\n  ${chalk.dim('['+ current +']')} › `);
     const parsed = field.parse(raw.trim());
     if (parsed !== null && String(parsed) !== current) {
       field.apply(cfg, parsed);
