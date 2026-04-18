@@ -10,7 +10,8 @@ const chalk = require('chalk');
 const { PID_FILE, LOG_FILE, LOG_DIR, CONFIG_FILE, CSK_DIR, PLIST_FILE } = require('../lib/paths');
 const configLib = require('../lib/config');
 const stateLib = require('../lib/state');
-const { printStatus, printInfo, formatTime, formatRelative } = require('../lib/display');
+const { printStatus, printInfo, printValidation, formatTime, formatRelative } = require('../lib/display');
+const { validate } = require('../lib/validate');
 const { computePingSchedule } = require('../lib/schedule');
 
 function isDaemonRunning() {
@@ -146,6 +147,7 @@ program.command('status')
     const config = configLib.read();
     const state = stateLib.read();
     printStatus(state, config, isDaemonRunning());
+    printValidation(config, state);
   });
 
 // info
@@ -155,6 +157,7 @@ program.command('info')
     const config = configLib.read();
     const state = stateLib.read();
     printInfo(state, config);
+    printValidation(config, state);
   });
 
 // logs
@@ -365,6 +368,7 @@ async function interactiveConfigSet() {
     console.log(chalk.dim('\nDaemon will pick up changes within 5 minutes.'));
   }
   console.log();
+  printValidation(cfg, stateLib.read());
 }
 
 // ─── config commands ──────────────────────────────────────────────────────────
@@ -396,6 +400,7 @@ configCmd.command('set [key] [value]')
     if (isDaemonRunning()) {
       console.log(chalk.dim('Daemon will pick up the change within 5 minutes.'));
     }
+    printValidation(updated, stateLib.read());
   });
 
 configCmd.command('show')
