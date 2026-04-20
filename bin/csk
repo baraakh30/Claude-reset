@@ -3,11 +3,12 @@
 const { program } = require('commander');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const readline = require('readline');
 const { spawnSync, spawn } = require('child_process');
 const chalk = require('chalk');
 
-const { PID_FILE, LOG_FILE, LOG_DIR, CONFIG_FILE, CSK_DIR, PLIST_FILE } = require('../lib/paths');
+const { PID_FILE, LOG_FILE, LOG_DIR, CONFIG_FILE, CSK_DIR, PLIST_FILE, SYSTEMD_DIR, SYSTEMD_FILE } = require('../lib/paths');
 const configLib = require('../lib/config');
 const stateLib = require('../lib/state');
 const { printStatus, printInfo, printValidation, formatTime, formatRelative } = require('../lib/display');
@@ -56,6 +57,28 @@ function writePlist(scriptPath) {
   fs.writeFileSync(PLIST_FILE, plist);
 }
 
+function writeSystemdUnit(scriptPath) {
+  fs.mkdirSync(SYSTEMD_DIR, { recursive: true });
+
+  const unit = `[Unit]
+Description=Claude Session Keeper
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${process.execPath} ${scriptPath} _daemon
+Restart=always
+RestartSec=5
+StandardOutput=append:${LOG_DIR}/daemon.stdout.log
+StandardError=append:${LOG_DIR}/daemon.stderr.log
+
+[Install]
+WantedBy=default.target
+`;
+
+  fs.writeFileSync(SYSTEMD_FILE, unit);
+}
+
 function startDirectly() {
   initDirs();
   const scriptPath = path.resolve(__filename);
@@ -90,8 +113,9 @@ program.command('start')
       console.log(chalk.dim(`Config created at ${CONFIG_FILE}`));
     }
 
+    const scriptPath = path.resolve(__filename);
+
     if (process.platform === 'darwin') {
-      const scriptPath = path.resolve(__filename);
       writePlist(scriptPath);
       try {
         spawnSync('launchctl', ['unload', PLIST_FILE], { stdio: 'pipe' });
@@ -104,6 +128,22 @@ program.command('start')
       } catch (e) {
         console.log(chalk.yellow(`launchd failed (${e.message}), falling back to direct launch`));
       }
+    } else if (process.platform === 'linux') {
+      writeSystemdUnit(scriptPath);
+      // Enable lingering so the user service survives logout
+      spawnSync('loginctl', ['enable-linger', os.userInfo().username], { stdio: 'pipe' });
+      // Reload unit files then start
+      spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
+      const r = spawnSync('systemctl', ['--user', 'enable', '--now', 'csk'], { stdio: 'pipe', encoding: 'utf8' });
+      if (r.status === 0) {
+        console.log(chalk.green('✓ Daemon started via systemd') + chalk.yellow(' [experimental]'));
+        console.log(chalk.dim(`  Unit: ${SYSTEMD_FILE}`));
+        console.log(chalk.dim(`  Logs: journalctl --user -u csk -f`));
+        console.log(chalk.dim(`  File: ${LOG_FILE}`));
+        console.log(chalk.yellow('  ⚠ Linux support is experimental — please report issues on GitHub'));
+        return;
+      }
+      console.log(chalk.yellow(`systemd failed (${r.stderr?.trim() || 'unknown'}), falling back to direct launch`));
     }
 
     startDirectly();
@@ -121,6 +161,10 @@ program.command('stop')
         console.log(chalk.green('✓ Daemon stopped (launchd)'));
         stopped = true;
       }
+    } else if (process.platform === 'linux' && fs.existsSync(SYSTEMD_FILE)) {
+      spawnSync('systemctl', ['--user', 'disable', '--now', 'csk'], { stdio: 'pipe' });
+      console.log(chalk.green('✓ Daemon stopped (systemd)'));
+      stopped = true;
     }
 
     if (!stopped) {
@@ -164,9 +208,17 @@ program.command('info')
 program.command('logs')
   .description('Tail the daemon log file')
   .option('-n, --lines <n>', 'Lines to show initially', '50')
+  .option('-j, --journald', 'Use journalctl instead of log file (Linux systemd only)')
   .action((opts) => {
+    if (opts.journald || (process.platform === 'linux' && fs.existsSync(SYSTEMD_FILE) && !fs.existsSync(LOG_FILE))) {
+      spawnSync('journalctl', ['--user', '-u', 'csk', '-f', '-n', opts.lines], { stdio: 'inherit' });
+      return;
+    }
     if (!fs.existsSync(LOG_FILE)) {
       console.log(chalk.gray('No log file yet. Start the daemon first.'));
+      if (process.platform === 'linux') {
+        console.log(chalk.dim('  Try: journalctl --user -u csk -f'));
+      }
       return;
     }
     spawnSync('tail', ['-f', '-n', opts.lines, LOG_FILE], { stdio: 'inherit' });
